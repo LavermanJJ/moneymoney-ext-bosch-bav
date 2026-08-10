@@ -1,4 +1,4 @@
-# moneymoney-ext-bosch-bav
+# Bosch Vorsorgeplan for Money Money
 
 Inofficial [MoneyMoney](https://moneymoney.app/) WebBanking extension that reads the
 current value of your Bosch Vorsorgeplan / Bosch Pensionsfonds account (bAV) from
