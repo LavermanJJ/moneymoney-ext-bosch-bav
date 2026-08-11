@@ -14,39 +14,36 @@ would break this extension.
 
 1. Logs into the participant portal ("Mit Zugangsdaten zum Altersversorgungskonto") with
    your username and password.
-2. If your account has the app-based second factor enabled, MoneyMoney will prompt you
-   for the "Bestätigungscode" shown in your authenticator app.
-3. Opens the "Beitragsübersicht" page and reads the total "Kontostand" value into a
-   single savings-type account in MoneyMoney.
-4. For every year of contribution history offered by the portal, opens the "Monatssicht"
-   (monthly view) and turns every contribution row (Firmenbeitrag, Beitrag AVWL,
-   Mitarbeiterbeitrag, ...) of every month into a transaction, dated to the 1st of that
-   month. All years are re-fetched on every refresh (a handful of extra requests) rather
-   than relying on MoneyMoney's `since` parameter, because MoneyMoney only ever moves
-   `since` forward from transactions it already knows about — if older years were skipped
-   once, they'd never get backfilled later.
-5. Also reads "Wertzuwachs" (investment growth) and "Firmenzuschuss" from the
-   "Kapitalzusammensetzung" breakdown. Unlike contributions, these have no dated/monthly
-   breakdown of their own — they're cumulative running totals (Wertzuwachs is like
-   unrealized gains on a portfolio; Firmenzuschuss only appears there irregularly). The
-   extension tracks the last known value of each in `LocalStorage` and books one
-   transaction per refresh for the *change* since the previous refresh, labeled just
-   "Wertzuwachs"/"Firmenzuschuss" — the booking date and the sign of the amount already
-   make it clear whether it grew or shrank. On the very first refresh there's no prior
-   value yet (treated as 0), so that refresh books the full current total as a starting
-   transaction instead of it being invisible forever.
-6. Uses your Bosch-Personalnummer (from "Mein Profil") as the account's Kontonummer in
+2. If your account has the app-based second factor enabled, MoneyMoney prompts you for the
+   "Bestätigungscode" shown in your authenticator app.
+3. Presents your bAV as a **Depot (portfolio)** account with a single position, using the
+   "Kontostand" and your "Mitarbeiterbeitrag" from the "Beitragsübersicht" page:
+   - **Einstand** (cost basis) = your own Mitarbeiterbeitrag — the money you personally
+     paid in via Entgeltumwandlung.
+   - **Wert** (current value) = the total Kontostand.
+   - **Gewinn** = Kontostand − Mitarbeiterbeitrag = the Arbeitgeber-Beiträge (Firmenbeitrag,
+     Firmenzuschuss, AVWL) **plus** the Wertzuwachs (market growth) — i.e. everything you
+     did *not* pay yourself.
+
+   This is deliberately framed as your **personal return** on your own contribution, which
+   for a bAV is typically very large (employer money + subsidies + market growth on top of
+   what you put in). It is intentionally *not* the fund's performance — for that, the
+   Wertzuwachs alone would be the relevant figure. The position is named to make the
+   composition of the gain explicit.
+4. Uses your Bosch-Personalnummer (from "Mein Profil") as the account's Kontonummer in
    MoneyMoney, rather than a generic placeholder.
-7. Downloads "Kontoauszug" and "Renteninformation" PDFs from the Postfach's
+5. Downloads "Kontoauszug" and "Renteninformation" PDFs from the Postfach's
    "Kontoauszüge und Renteninformationen" category into MoneyMoney's Dokumente view, via
    the undocumented `FetchStatements` entry point (not part of the public WebBanking API
    reference, but supported by the app — confirmed by inspecting a real published
    extension that uses it the same way). Only new documents (by filename) are downloaded
    on each refresh.
 
-The "Anmelden mit Bosch-Konto" SSO button (corporate Bosch account / Okta-style login for
-active employees) is **not** supported — only the direct username/password login for the
-pension account itself.
+The extension provides only the *current* snapshot each refresh; MoneyMoney builds the
+value-over-time chart forward from when you add the account (past values can't be
+backfilled via the extension API). The "Anmelden mit Bosch-Konto" SSO button (corporate
+Bosch account / Okta-style login for active employees) is **not** supported — only the
+direct username/password login for the pension account itself.
 
 ## Installation
 
@@ -84,7 +81,7 @@ The extension is a single file, `BoschVorsorgeplan.lua`, with no dependencies. S
 it with `luac -p BoschVorsorgeplan.lua`.
 
 The XPath selectors were derived from local, saved copies of the portal pages (login, 2FA,
-account overview, monthly view, profile, and Postfach). Those saved pages — and any debug
+account overview, profile, and Postfach). Those saved pages — and any debug
 logs — contain real personal data (name, balance, Personalnummer, account numbers) and are
 kept out of the repository via `.gitignore`. **Never commit or share them.** When adding
 selectors, document the target HTML with anonymized placeholder values only.

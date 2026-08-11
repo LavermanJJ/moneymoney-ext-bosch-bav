@@ -1,1 +1,9 @@
 .DS_Store
+
+# Saved portal pages contain your real login page, balance and account data -
+# keep them local only, never commit/share them (this repo is public).
+/boschvorsorgeplan.de/
+
+# Debug logs from real test runs also contain personal account data.
+/setup.log
+*.log

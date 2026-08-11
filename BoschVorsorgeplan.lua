@@ -89,15 +89,9 @@ local function MfaFormPresent(html)
   return html:xpath("//input[@id='otp']"):length() > 0
 end
 
--- Categories from the "Kapitalzusammensetzung" breakdown on the
--- Beitragsübersicht page that have no dated/monthly breakdown of their own
--- (unlike Firmenbeitrag, Beitrag AVWL, Mitarbeiterbeitrag): "Wertzuwachs"
--- (investment growth) is a running cumulative total like unrealized gains
--- on a portfolio, and "Firmenzuschuss" only shows up there irregularly.
--- Both are tracked as a running total across refreshes further down, only
--- booking the change since the last refresh.
-local trackedCapitalCategories = { "Wertzuwachs", "Firmenzuschuss" }
-
+-- Reads one row's amount from the "Kapitalzusammensetzung" breakdown on the
+-- Beitragsübersicht page (e.g. "Mitarbeiterbeitrag" -> your own contribution
+-- total). Used as the cost basis of the portfolio position.
 local function FindCapitalCategoryAmount(html, label)
   local nodes = html:xpath(
     "//table[@aria-label='Beiträge der Kapitalzusammensetzung']//tr[td[1][normalize-space()='" .. label .. "']]/td[2]"
@@ -160,82 +154,6 @@ local function ParseStatementDate(fileName)
     return os.time()
   end
   return os.time({ year = 2000 + tonumber(yy), month = tonumber(mm), day = tonumber(dd), hour = 12 })
-end
-
-local germanMonths = {
-  ["Januar"] = 1, ["Februar"] = 2, ["März"] = 3, ["April"] = 4,
-  ["Mai"] = 5, ["Juni"] = 6, ["Juli"] = 7, ["August"] = 8,
-  ["September"] = 9, ["Oktober"] = 10, ["November"] = 11, ["Dezember"] = 12
-}
-
-local function CombinePurpose(group, kind)
-  if kind == "" or kind == group then
-    return group
-  end
-  return group .. " – " .. kind
-end
-
--- Finds the "Monatssicht" forms on the Beitragsübersicht page, one per year
--- of contribution history, e.g.:
---   <form id="show-2026-form" ...>
---     <input name="p_auth" ...><input name="action" value="exec-konto">
---     <input name="paramName" value="jahr"><input name="paramValue" value="2026">
---     <input name="actionValue" value="next">
---     <input name="friendlyURL" value="/monatssicht">
---     <input name="portletName" value="beitragshistorie-jahr">
---   </form>
-local function FindYearForms(html)
-  local years = {}
-  html:xpath("//form[.//input[@name='friendlyURL' and @value='/monatssicht']]"):each(function(_, form)
-    local fields = ReadFormFields(form)
-    local year = tonumber(fields["paramValue"])
-    if year then
-      table.insert(years, { year = year, action = form:attr("action"), fields = fields })
-    end
-  end)
-  return years
-end
-
--- Fetches the monthly contribution breakdown ("Monatssicht") for one year
--- and turns each contribution row of each month into a transaction. Each
--- month is an accordion identified by an id containing "_acc_contrsum_",
--- e.g. "..._acc_contrsum_0_hdln" (headline) / "..._acc_contrsum_0_cnt"
--- (content table). The content table's last row is a per-month total with
--- empty "Beitragsgruppe"/"Beitragsart" cells, which is skipped.
-local function FetchMonthlyTransactions(yearForm)
-  local content, charset = connection:post(
-    yearForm.action, UrlEncodeFields(yearForm.fields), "application/x-www-form-urlencoded"
-  )
-  local html = HTML(content, charset)
-  local transactions = {}
-
-  html:xpath("//h2[contains(@id,'_acc_contrsum_') and contains(@id,'_hdln')]"):each(function(_, headline)
-    local contentId = headline:attr("id"):gsub("_hdln$", "_cnt")
-    local monthName = trim(headline:xpath(".//span[@class='col-6']"):text())
-    local month = germanMonths[monthName]
-    if month then
-      local bookingDate = os.time({ year = yearForm.year, month = month, day = 1, hour = 12 })
-      html:xpath("//div[@id='" .. contentId .. "']//table//tbody/tr"):each(function(_, row)
-        local group = trim(row:xpath("./td[1]"):text() or "")
-        if group ~= "" then
-          local kind = trim(row:xpath("./td[2]"):text() or "")
-          local amount = ParseAmount(row:xpath("./td[3]"):text())
-          if amount and amount ~= 0 then
-            table.insert(transactions, {
-              name = "Bosch Vorsorgeplan",
-              amount = amount,
-              currency = "EUR",
-              bookingDate = bookingDate,
-              purpose = CombinePurpose(group, kind),
-              booked = true
-            })
-          end
-        end
-      end)
-    end
-  end)
-
-  return transactions
 end
 
 -- WebBanking API impl
@@ -339,7 +257,8 @@ function ListAccounts(knownAccounts)
       name = "Bosch Vorsorgeplan",
       accountNumber = accountNumber,
       currency = "EUR",
-      type = AccountTypeSavings
+      portfolio = true,
+      type = AccountTypePortfolio
     }
   }
 end
@@ -362,50 +281,27 @@ function RefreshAccount(account, since)
     error("Der Kontostand-Text (" .. tostring(amountNodes:text()) .. ") konnte nicht als Zahl interpretiert werden.")
   end
 
-  -- Always fetch every year the portal offers, regardless of `since`:
-  -- MoneyMoney applies its own lookback default (e.g. "last 12 months") on
-  -- the very first refresh rather than passing since=nil, and later
-  -- refreshes only ever advance `since` forward from the newest
-  -- transaction MoneyMoney has already stored. If older years were
-  -- skipped once, they would never get backfilled - so it's not worth
-  -- trying to optimize this away. MoneyMoney itself discards whatever
-  -- falls outside the requested range.
-  local transactions = {}
-  for _, yearForm in ipairs(FindYearForms(html)) do
-    MM.printStatus("Rufe Beiträge " .. yearForm.year .. " ab")
-    for _, transaction in ipairs(FetchMonthlyTransactions(yearForm)) do
-      table.insert(transactions, transaction)
-    end
-  end
+  -- Model the whole bAV as a single portfolio position so MoneyMoney's Depot
+  -- shows the gain you actually care about:
+  --   cost basis (Einstand) = your own Mitarbeiterbeitrag (Entgeltumwandlung)
+  --   current value         = Kontostand
+  -- The Gewinn MoneyMoney then computes = Kontostand - Mitarbeiterbeitrag =
+  -- the Arbeitgeber-Beiträge (Firmenbeitrag, Firmenzuschuss, AVWL) plus the
+  -- Wertzuwachs, i.e. everything you did not pay yourself. If the
+  -- Mitarbeiterbeitrag can't be read, cost falls back to 0 (Gewinn = full value).
+  local eigenbeitrag = FindCapitalCategoryAmount(html, "Mitarbeiterbeitrag") or 0
 
-  -- Wertzuwachs/Firmenzuschuss have no dated breakdown, only a cumulative
-  -- total, so we track that total across refreshes ourselves and book the
-  -- change since last time. On the very first refresh there's no prior
-  -- value yet, so it's treated as 0 - meaning the full current total gets
-  -- booked as a starting transaction, rather than being invisible forever.
-  -- The date and sign of the amount already make it obvious whether it
-  -- grew or shrank, so the purpose is just the category label.
-  for _, label in ipairs(trackedCapitalCategories) do
-    local currentValue = FindCapitalCategoryAmount(html, label)
-    if currentValue then
-      local storageKey = label .. "_" .. account.accountNumber
-      local previousValue = LocalStorage[storageKey] or 0
-      local delta = currentValue - previousValue
-      if math.abs(delta) >= 0.01 then
-        table.insert(transactions, {
-          name = "Bosch Vorsorgeplan",
-          amount = delta,
-          currency = "EUR",
-          bookingDate = os.time(),
-          purpose = label,
-          booked = true
-        })
-      end
-      LocalStorage[storageKey] = currentValue
-    end
-  end
+  local security = {
+    name = "Bosch Vorsorgeplan (Gewinn = Arbeitgeber-Beiträge + Wertzuwachs)",
+    quantity = 1,
+    amount = balance,
+    price = balance,
+    currencyOfPrice = "EUR",
+    purchasePrice = eigenbeitrag,
+    currencyOfPurchasePrice = "EUR"
+  }
 
-  return { balance = balance, transactions = transactions }
+  return { securities = { security } }
 end
 
 -- Undocumented MoneyMoney entry point (not in the public WebBanking API
