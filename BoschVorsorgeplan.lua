@@ -34,7 +34,8 @@ WebBanking{
 local connection = Connection()
 connection.language = "de-DE"
 
-local baseUrl        = "https://www.boschvorsorgeplan.de"
+local allowedHost    = "www.boschvorsorgeplan.de"
+local baseUrl        = "https://" .. allowedHost
 local loginPageUrl    = baseUrl .. "/portal/web/bosch/home"
 local overviewPageUrl = baseUrl .. "/portal/group/bosch/beitragsubersicht"
 local profilePageUrl  = baseUrl .. "/portal/group/bosch/account"
@@ -71,6 +72,56 @@ local function ReadFormFields(form)
     end
   end)
   return fields
+end
+
+-- Form actions and document links are taken from HTML the portal delivers, so
+-- they are never used verbatim: username/password, the second-factor code and
+-- the session cookies must only ever be sent to the portal itself. Every such
+-- URL is resolved against the page it was found on and then checked to be
+-- HTTPS on exactly `allowedHost` - anything else aborts the request.
+local function ResolveUrl(url, pageUrl)
+  -- Absolute URL (including non-http schemes, which fail the check below).
+  if url:match("^%a[%w+.%-]*:") then
+    return url
+  end
+  -- Protocol-relative "//host/path".
+  if url:match("^//") then
+    return "https:" .. url
+  end
+  if url:match("^/") then
+    return baseUrl .. url
+  end
+  local basePath = pageUrl:gsub("#.*$", "")
+  if url:match("^%?") then
+    return (basePath:gsub("%?.*$", "")) .. url
+  end
+  -- Path-relative: replace the last segment of the base path.
+  return (basePath:gsub("%?.*$", ""):gsub("[^/]*$", "")) .. url
+end
+
+-- Returns the validated absolute URL, or nil plus an error message. Callers in
+-- the login phase hand that message straight back to MoneyMoney (which shows
+-- it in a dialog); elsewhere it is passed to error().
+local function SecureUrl(url, pageUrl, description)
+  if type(url) ~= "string" or trim(url) == "" then
+    return nil, "Auf der Bosch-Vorsorgeplan-Seite wurde kein Ziel für " .. description ..
+      " gefunden. Die Seite wurde vermutlich geändert."
+  end
+
+  local absolute = ResolveUrl(trim(url), pageUrl)
+  local scheme, authority = absolute:match("^(%a[%w+.%-]*)://([^/?#]*)")
+
+  -- Reject anything but https, embedded credentials ("https://host@evil.tld")
+  -- and any host other than the portal - including look-alikes such as
+  -- "www.boschvorsorgeplan.de.evil.tld".
+  local host = authority and authority:lower():gsub(":443$", "") or nil
+  if not scheme or scheme:lower() ~= "https" or authority:find("@", 1, true) or host ~= allowedHost then
+    return nil, "Unerwartetes Ziel für " .. description .. ": " .. absolute ..
+      ". Erlaubt ist ausschließlich https://" .. allowedHost ..
+      ". Die Anfrage wurde aus Sicherheitsgründen abgebrochen."
+  end
+
+  return absolute
 end
 
 local function UrlEncodeFields(fields)
@@ -126,7 +177,7 @@ end
 --   </a> ... </div>
 -- Other categories (Bestätigungsschreiben, Lohnsteuerbescheinigung, ...)
 -- are intentionally not touched.
-local function FindStatementLinks(html)
+local function FindStatementLinks(html, pageUrl)
   local links = {}
   html:xpath(
     "//h2[contains(@id,'_acc_cat_') and contains(.,'Kontoauszüge und Renteninformationen')]"
@@ -135,8 +186,14 @@ local function FindStatementLinks(html)
     html:xpath("//div[@id='" .. contentId .. "']//a[contains(@href,'fileName=')]"):each(function(_, a)
       local fileName = a:attr("href"):match("fileName=([^&]+)")
       if fileName then
+        -- FetchStatements has no error-message return channel, so an
+        -- unexpected target aborts the run via error().
+        local url, urlError = SecureUrl(a:attr("href"), pageUrl, "den Dokument-Download")
+        if not url then
+          error(urlError)
+        end
         table.insert(links, {
-          url = a:attr("href"),
+          url = url,
           name = trim(a:text()),
           fileName = fileName
         })
@@ -178,7 +235,11 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
       return "Das Login-Formular wurde auf der Bosch-Vorsorgeplan-Seite nicht gefunden. Die Seite wurde vermutlich geändert."
     end
 
-    local action = form:attr("action")
+    local action, urlError = SecureUrl(form:attr("action"), loginPageUrl, "die Anmeldung")
+    if not action then
+      return urlError
+    end
+
     local fields = ReadFormFields(form)
 
     -- The visible username/password inputs are matched by type, since
@@ -197,7 +258,12 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
 
     if MfaFormPresent(respHtml) then
       local mfaForm = respHtml:xpath("//form[.//input[@id='otp']]")
-      mfaAction = mfaForm:attr("action")
+      local mfaTarget, mfaUrlError = SecureUrl(mfaForm:attr("action"), action, "die Zwei-Faktor-Authentifizierung")
+      if not mfaTarget then
+        return mfaUrlError
+      end
+
+      mfaAction = mfaTarget
       mfaAuthToken = mfaForm:xpath(".//input[@name='p_auth']"):attr("value")
 
       local label = trim(respHtml:xpath("//label[@for='otp']"):text() or "Bestätigungscode")
@@ -230,7 +296,13 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
     })
 
     MM.printStatus("Prüfe Bestätigungscode")
-    local respContent, respCharset = connection:post(mfaAction, postContent, "application/x-www-form-urlencoded")
+    local mfaUrl, urlError = SecureUrl(mfaAction, loginPageUrl, "die Zwei-Faktor-Authentifizierung")
+    if not mfaUrl then
+      mfaAction, mfaAuthToken = nil, nil
+      return urlError
+    end
+
+    local respContent, respCharset = connection:post(mfaUrl, postContent, "application/x-www-form-urlencoded")
     local respHtml = HTML(respContent, respCharset)
 
     mfaAction, mfaAuthToken = nil, nil
@@ -309,18 +381,14 @@ end
 -- Downloads Kontoauszug/Renteninformation PDFs from the Postfach that
 -- MoneyMoney doesn't already have, identified by their filename.
 function FetchStatements(accounts, knownIdentifiers)
-  local known = {}
-  for _, identifier in ipairs(knownIdentifiers) do
-    known[identifier] = true
-  end
-
   MM.printStatus("Suche Kontoauszüge im Postfach")
   local content, charset = connection:get(postfachPageUrl)
   local html = HTML(content, charset)
 
+  -- knownIdentifiers is a map identifier -> true, so it can be queried directly.
   local statements = {}
-  for _, link in ipairs(FindStatementLinks(html)) do
-    if not known[link.fileName] then
+  for _, link in ipairs(FindStatementLinks(html, postfachPageUrl)) do
+    if not knownIdentifiers[link.fileName] then
       MM.printStatus("Lade " .. link.name)
       local pdfContent = connection:get(link.url)
       table.insert(statements, {
