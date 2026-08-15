@@ -74,6 +74,33 @@ local function ReadFormFields(form)
   return fields
 end
 
+-- RFC 3986 remove_dot_segments, so that "../" in a portal-supplied link cannot
+-- end up in a request path verbatim.
+local function RemoveDotSegments(path)
+  local segments = {}
+  for segment in path:gmatch("[^/]+") do
+    if segment == ".." then
+      table.remove(segments)
+    elseif segment ~= "." then
+      table.insert(segments, segment)
+    end
+  end
+  local normalized = "/" .. table.concat(segments, "/")
+  -- A path ending in "/", "/." or "/.." denotes a directory.
+  if normalized ~= "/" and (path:sub(-1) == "/" or path:match("/%.%.?$")) then
+    normalized = normalized .. "/"
+  end
+  return normalized
+end
+
+local function NormalizeUrl(url)
+  local prefix, path, rest = url:match("^(%a[%w+.%-]*://[^/?#]*)(/[^?#]*)(.*)$")
+  if not prefix then
+    return url
+  end
+  return prefix .. RemoveDotSegments(path) .. rest
+end
+
 -- Form actions and document links are taken from HTML the portal delivers, so
 -- they are never used verbatim: username/password, the second-factor code and
 -- the session cookies must only ever be sent to the portal itself. Every such
@@ -92,6 +119,10 @@ local function ResolveUrl(url, pageUrl)
     return baseUrl .. url
   end
   local basePath = pageUrl:gsub("#.*$", "")
+  -- Fragment-only reference: keep the page URL, including its query string.
+  if url:match("^#") then
+    return basePath .. url
+  end
   if url:match("^%?") then
     return (basePath:gsub("%?.*$", "")) .. url
   end
@@ -103,12 +134,20 @@ end
 -- the login phase hand that message straight back to MoneyMoney (which shows
 -- it in a dialog); elsewhere it is passed to error().
 local function SecureUrl(url, pageUrl, description)
-  if type(url) ~= "string" or trim(url) == "" then
+  if type(url) ~= "string" then
     return nil, "Auf der Bosch-Vorsorgeplan-Seite wurde kein Ziel für " .. description ..
       " gefunden. Die Seite wurde vermutlich geändert."
   end
 
-  local absolute = ResolveUrl(trim(url), pageUrl)
+  -- An empty action means "submit to the current document" (HTML spec), so it
+  -- resolves to the page the form was found on - which is host-checked below
+  -- just like any other target.
+  local target = trim(url)
+  if target == "" then
+    target = pageUrl
+  end
+
+  local absolute = NormalizeUrl(ResolveUrl(target, pageUrl))
   local scheme, authority = absolute:match("^(%a[%w+.%-]*)://([^/?#]*)")
 
   -- Reject anything but https, embedded credentials ("https://host@evil.tld")
@@ -122,6 +161,18 @@ local function SecureUrl(url, pageUrl, description)
   end
 
   return absolute
+end
+
+-- Relative URLs in a response must be resolved against the document's final
+-- URL, which after a POST-redirect-GET is not the URL we requested.
+-- connection:getBaseURL() reports it; older MoneyMoney versions without that
+-- method fall back to the requested URL.
+local function ResponseBaseUrl(requestedUrl)
+  local ok, documentUrl = pcall(function() return connection:getBaseURL() end)
+  if ok and type(documentUrl) == "string" and trim(documentUrl) ~= "" then
+    return trim(documentUrl)
+  end
+  return requestedUrl
 end
 
 local function UrlEncodeFields(fields)
@@ -186,17 +237,19 @@ local function FindStatementLinks(html, pageUrl)
     html:xpath("//div[@id='" .. contentId .. "']//a[contains(@href,'fileName=')]"):each(function(_, a)
       local fileName = a:attr("href"):match("fileName=([^&]+)")
       if fileName then
-        -- FetchStatements has no error-message return channel, so an
-        -- unexpected target aborts the run via error().
+        -- A link pointing somewhere else is skipped rather than fetched. It
+        -- must not abort the run, or one odd entry would hide every other
+        -- statement in the Postfach.
         local url, urlError = SecureUrl(a:attr("href"), pageUrl, "den Dokument-Download")
-        if not url then
-          error(urlError)
+        if url then
+          table.insert(links, {
+            url = url,
+            name = trim(a:text()),
+            fileName = fileName
+          })
+        else
+          MM.printStatus(urlError)
         end
-        table.insert(links, {
-          url = url,
-          name = trim(a:text()),
-          fileName = fileName
-        })
       end
     end)
   end)
@@ -235,7 +288,7 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
       return "Das Login-Formular wurde auf der Bosch-Vorsorgeplan-Seite nicht gefunden. Die Seite wurde vermutlich geändert."
     end
 
-    local action, urlError = SecureUrl(form:attr("action"), loginPageUrl, "die Anmeldung")
+    local action, urlError = SecureUrl(form:attr("action"), ResponseBaseUrl(loginPageUrl), "die Anmeldung")
     if not action then
       return urlError
     end
@@ -258,7 +311,10 @@ function InitializeSession2(protocol, bankCode, step, credentials, interactive)
 
     if MfaFormPresent(respHtml) then
       local mfaForm = respHtml:xpath("//form[.//input[@id='otp']]")
-      local mfaTarget, mfaUrlError = SecureUrl(mfaForm:attr("action"), action, "die Zwei-Faktor-Authentifizierung")
+      -- The login POST is answered with a redirect, so the MFA form's action is
+      -- relative to the redirect target, not to `action`.
+      local mfaTarget, mfaUrlError =
+        SecureUrl(mfaForm:attr("action"), ResponseBaseUrl(action), "die Zwei-Faktor-Authentifizierung")
       if not mfaTarget then
         return mfaUrlError
       end
@@ -387,7 +443,7 @@ function FetchStatements(accounts, knownIdentifiers)
 
   -- knownIdentifiers is a map identifier -> true, so it can be queried directly.
   local statements = {}
-  for _, link in ipairs(FindStatementLinks(html, postfachPageUrl)) do
+  for _, link in ipairs(FindStatementLinks(html, ResponseBaseUrl(postfachPageUrl))) do
     if not knownIdentifiers[link.fileName] then
       MM.printStatus("Lade " .. link.name)
       local pdfContent = connection:get(link.url)
